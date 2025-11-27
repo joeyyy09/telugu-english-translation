@@ -1,27 +1,27 @@
+# main.py
 # ===============================================================
-# English -> Telugu NMT (Teacher: NLLB, Student: BiGRU)
-# FINAL VERSION WITH ALL IMPROVEMENTS:
+# English -> Telugu NMT (Teacher: NLLB, Student: BiGRU + Attention)
 #
 #  - Data cleaning, filtering, deduplication
-#  - SentencePiece tokenization
-#  - Teacher beam-search translation (better quality)
-#  - Temperature-scaled knowledge distillation
-#  - Top-k soft target distillation (MUCH better KD)
-#  - Label smoothing on hard CE loss
-#  - Mixed precision (AMP) for faster training
-#  - Increased student model capacity
-#  - Stable training with grad-clipping
-#  - Full logging to console + timestamped .log file
+#  - SentencePiece tokenization (separate EN / TE)
+#  - Teacher sequence-level KD (NLLB translations as targets)
+#  - BiGRU encoder + Bahdanau attention decoder
+#  - Mixed precision (AMP) + grad clipping
+#  - Train / Val split
+#  - chrF + BLEU vs HUMAN Telugu (validation subset)
+#  - Caching:
+#      * Teacher translations (NLLB) with hash
+#      * SentencePiece models with hash
+#  - Early stopping on validation loss
 #
-# DOES NOT change architecture type (still BiGRU encoder-decoder)
+#  Set EPOCHS=30; early stopping will stop when it stops improving.
 # ===============================================================
 
 import os
 import sys
 import time
-import math
 import random
-import logging
+import hashlib
 from typing import List, Tuple
 
 import numpy as np
@@ -34,93 +34,99 @@ from torch.utils.data import Dataset, DataLoader
 from torch.cuda.amp import autocast, GradScaler
 
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
-
 import sentencepiece as spm
-
 
 # ===============================================================
 # CONFIG
 # ===============================================================
 
 DATA_PATH = "English Telugu Data.txt"
+
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+print("Using device:", DEVICE)
+
 SEED = 42
 
 # Teacher config
 TEACHER_MODEL = "facebook/nllb-200-distilled-600M"
 TEACHER_BATCH = 32
-TEACHER_MAX_LEN = 128
+TEACHER_MAX_LEN = 100
 TEACHER_BEAMS = 4
-KD_TEMPERATURE = 2.0
-KD_TOPK = 8              # top-k soft logits from teacher
 
 # Student config
-EPOCHS = 5
+EPOCHS = 30          # you can reduce to 2 while debugging
 BATCH_SIZE = 64
-EMB = 512
-HID = 512
+EMB_DIM = 512
+ENC_HID_DIM = 256           # per direction
+DEC_HID_DIM = ENC_HID_DIM * 2
 LR = 0.0008
 GRAD_CLIP = 1.0
+TEACHER_FORCING = 0.8
 
 # Tokenizer configs
-SP_SRC_VOCAB = 32000
-SP_TGT_VOCAB = 32000
+SP_SRC_VOCAB = 12000
+SP_TGT_VOCAB = 12000
 
 SP_SRC_PREFIX = "sp_src"
 SP_TGT_PREFIX = "sp_tgt"
 
-MAX_SRC_LEN = 120
-MAX_TGT_LEN = 120
+MAX_SRC_LEN = 100
+MAX_TGT_LEN = 100
 
 PAD_ID = 0
 
-# Label smoothing
-LABEL_SMOOTH = 0.1
+# Evaluation subset
+VAL_SAMPLES_FOR_BLEU = 500
 
+# Early stopping
+PATIENCE = 5          # epochs without improvement before stopping
 
-# ===============================================================
-# LOGGING SETUP
-# ===============================================================
-
-TS = time.strftime("%Y%m%d-%H%M%S")
-LOG_FILE = f"run_{TS}.log"
-
-logger = logging.getLogger("nmt")
-logger.setLevel(logging.DEBUG)
-
-fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-
-fh = logging.FileHandler(LOG_FILE, "w", encoding="utf-8")
-fh.setFormatter(fmt)
-fh.setLevel(logging.DEBUG)
-logger.addHandler(fh)
-
-sh = logging.StreamHandler(sys.stdout)
-sh.setFormatter(fmt)
-sh.setLevel(logging.INFO)
-logger.addHandler(sh)
-
-logger.info("=== FINAL NMT RUN STARTED ===")
-
+# Cache files
+TEACHER_OUT_PATH = "teacher_outputs.txt"
+TEACHER_HASH_PATH = "teacher_hash.txt"
+SP_HASH_PATH = "sp_hash.txt"
 
 # ===============================================================
-# SEED FIX
+# SEED / CUDNN
 # ===============================================================
+
 def fix_seed(seed=SEED):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if DEVICE == "cuda":
         torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.benchmark = True
+        # More deterministic; benchmark off to avoid weirdness on Windows
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
 
 fix_seed()
 
+# ===============================================================
+# LOGGING (simple)
+# ===============================================================
+
+def log(msg: str):
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] {msg}")
+    sys.stdout.flush()
+
+# ===============================================================
+# HASH UTILS
+# ===============================================================
+
+def compute_hash(lines: List[str]) -> str:
+    m = hashlib.md5()
+    for s in lines:
+        m.update(s.encode("utf-8"))
+        m.update(b"\n")
+    return m.hexdigest()
 
 # ===============================================================
 # DATA LOADING + CLEANING
 # ===============================================================
-def read_pairs(path):
+
+def read_pairs(path: str) -> List[Tuple[str, str]]:
     if not os.path.exists(path):
         raise FileNotFoundError(path)
     eng, tel = [], []
@@ -133,19 +139,20 @@ def read_pairs(path):
             tel.append(b.strip())
     return list(zip(eng, tel))
 
-def clean_text(s):
+def clean_text(s: str) -> str:
     s = "".join(ch for ch in s if ch.isprintable())
     s = s.replace("\u200b", "")
     s = " ".join(s.split())
     return s
 
-def is_telugu(s):
+def is_telugu(s: str) -> bool:
     total = len(s)
-    if total == 0: return False
+    if total == 0:
+        return False
     tel = sum(1 for ch in s if 0x0C00 <= ord(ch) <= 0x0C7F)
     return tel / total >= 0.25
 
-def clean_pairs(pairs):
+def clean_pairs(pairs: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
     out = []
     seen = set()
     for s, t in pairs:
@@ -155,19 +162,91 @@ def clean_pairs(pairs):
             continue
         if not is_telugu(t):
             continue
-        if len(s.split()) > MAX_SRC_LEN: continue
-        if len(t.split()) > MAX_TGT_LEN: continue
+        if len(s.split()) > MAX_SRC_LEN:
+            continue
+        if len(t.split()) > MAX_TGT_LEN:
+            continue
         key = (s.lower(), t)
-        if key in seen: continue
+        if key in seen:
+            continue
         seen.add(key)
         out.append((s, t))
-    logger.info("After cleaning: %d pairs", len(out))
+    log(f"After cleaning: {len(out)} pairs")
     return out
 
+# ===============================================================
+# TEACHER TRANSLATION CACHING
+# ===============================================================
+
+def load_or_run_teacher(src_texts: List[str]) -> Tuple[List[str], str]:
+    """
+    Returns teacher translations for all src_texts and the hash.
+    Uses cache if possible.
+    """
+    current_hash = compute_hash(src_texts)
+
+    if os.path.exists(TEACHER_OUT_PATH) and os.path.exists(TEACHER_HASH_PATH):
+        with open(TEACHER_HASH_PATH, "r", encoding="utf-8") as f:
+            old_hash = f.read().strip()
+        if old_hash == current_hash:
+            with open(TEACHER_OUT_PATH, "r", encoding="utf-8") as f:
+                lines = [x.rstrip("\n") for x in f]
+            if len(lines) == len(src_texts):
+                log("Reusing cached teacher translations (hash + length match).")
+                return lines, current_hash
+            else:
+                log("Cached teacher outputs length mismatch. Will recompute.")
+
+    # Need to run teacher
+    log("Running teacher NLLB for translations (no valid cache).")
+    tokenizer = AutoTokenizer.from_pretrained(TEACHER_MODEL)
+    model = AutoModelForSeq2SeqLM.from_pretrained(TEACHER_MODEL).to(DEVICE)
+    model.eval()
+
+    translations = []
+    tokenizer.src_lang = "eng_Latn"
+    try:
+        forced_bos_token_id = tokenizer.convert_tokens_to_ids("tel_Telu")
+    except Exception:
+        forced_bos_token_id = None
+
+    for i in tqdm(range(0, len(src_texts), TEACHER_BATCH), desc="Teacher beam search"):
+        batch = src_texts[i:i + TEACHER_BATCH]
+        enc = tokenizer(
+            batch,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=TEACHER_MAX_LEN,
+        ).to(DEVICE)
+        gen_kwargs = dict(
+            max_length=TEACHER_MAX_LEN,
+            num_beams=TEACHER_BEAMS,
+            do_sample=False,
+        )
+        if forced_bos_token_id is not None:
+            gen_kwargs["forced_bos_token_id"] = forced_bos_token_id
+        with torch.no_grad():
+            gen = model.generate(**enc, **gen_kwargs)
+        dec = tokenizer.batch_decode(gen, skip_special_tokens=True)
+        translations.extend(dec)
+
+    assert len(translations) == len(src_texts)
+
+    # Save cache
+    with open(TEACHER_OUT_PATH, "w", encoding="utf-8") as f:
+        for line in translations:
+            f.write(line.replace("\n", " ") + "\n")
+    with open(TEACHER_HASH_PATH, "w", encoding="utf-8") as f:
+        f.write(current_hash)
+
+    log("Saved teacher outputs + hash for future runs.")
+    return translations, current_hash
 
 # ===============================================================
 # SENTENCEPIECE
 # ===============================================================
+
 def write_list(path, lst):
     with open(path, "w", encoding="utf-8") as f:
         for x in lst:
@@ -189,327 +268,478 @@ def train_sp(input_file, prefix, vocab):
     sp.load(prefix + ".model")
     return sp
 
-
-# ===============================================================
-# STUDENT MODEL
-# ===============================================================
-class Encoder(nn.Module):
-    def __init__(self, vocab, emb, hid):
-        super().__init__()
-        self.emb = nn.Embedding(vocab, emb, padding_idx=0)
-        self.gru = nn.GRU(emb, hid, batch_first=True, bidirectional=True)
-
-    def forward(self, x):
-        e = self.emb(x)
-        out, h = self.gru(e)
-        h = torch.cat([h[0], h[1]], dim=1)  # [B, 2H]
-        return out, h
-
-
-class Decoder(nn.Module):
-    def __init__(self, vocab, emb, hid):
-        super().__init__()
-        self.emb = nn.Embedding(vocab, emb, padding_idx=0)
-        self.gru = nn.GRU(emb, hid, batch_first=True)
-        self.lin = nn.Linear(hid, vocab)
-
-    def forward(self, tgt, h0):
-        e = self.emb(tgt)
-        out, h1 = self.gru(e, h0.unsqueeze(0))
-        logits = self.lin(out)
-        return logits, h1.squeeze(0)
-
-
-class Seq2Seq(nn.Module):
-    def __init__(self, enc, dec):
-        super().__init__()
-        self.enc = enc
-        self.dec = dec
-
-    def forward(self, src, tgt, teacher_forcing=True):
-        _, h = self.enc(src)
-        logits, _ = self.dec(tgt, h)
-        return logits
-
-
-# ===============================================================
-# DISTILLATION + LABEL SMOOTHING
-# ===============================================================
-def label_smooth_loss(logits, targets, eps=0.1, ignore_idx=0):
+def load_or_train_sp(src_texts: List[str],
+                     teacher_tgt_texts: List[str],
+                     data_hash: str):
     """
-    Standard label smoothing CE.
+    Cache SentencePiece models based on data_hash.
+    If sp_src.model / sp_tgt.model + sp_hash.txt exist and hash matches, reuse.
+    Otherwise retrain.
     """
-    B, T, V = logits.size()
-    logits = logits.view(B*T, V)
-    targets = targets.view(B*T)
+    src_model_path = SP_SRC_PREFIX + ".model"
+    tgt_model_path = SP_TGT_PREFIX + ".model"
 
-    prob = torch.softmax(logits, dim=1)
-    log_prob = torch.log(prob + 1e-9)
+    if (
+        os.path.exists(src_model_path)
+        and os.path.exists(tgt_model_path)
+        and os.path.exists(SP_HASH_PATH)
+    ):
+        with open(SP_HASH_PATH, "r", encoding="utf-8") as f:
+            old_hash = f.read().strip()
+        if old_hash == data_hash:
+            sp_src = spm.SentencePieceProcessor()
+            sp_tgt = spm.SentencePieceProcessor()
+            sp_src.load(src_model_path)
+            sp_tgt.load(tgt_model_path)
+            log("Reusing cached SentencePiece models (hash match).")
+            return sp_src, sp_tgt
 
-    n_classes = V
-
-    true_dist = torch.zeros_like(prob)
-    true_dist.fill_(eps / (n_classes - 1))
-    mask = targets != ignore_idx
-    true_dist[mask, targets[mask]] = 1 - eps
-
-    loss = -(true_dist * log_prob).sum(dim=1)
-    loss = loss[mask].mean()
-    return loss
-
-
-def kd_soft_loss(student_logits, teacher_logits, temp):
-    """
-    teacher_logits and student_logits are [B,T,V]
-    """
-    p = torch.log_softmax(student_logits / temp, dim=-1)
-    q = torch.softmax(teacher_logits / temp, dim=-1)
-    loss = torch.nn.functional.kl_div(p, q, reduction="batchmean") * (temp*temp)
-    return loss
-
-
-# ===============================================================
-# TEACHER TOP-K LOGITS EXTRACTION
-# ===============================================================
-def build_teacher_soft_targets(teacher_model, teacher_tok, sentences, max_len, k=8):
-    """
-    Returns a list of T x V tensors with top-k logits for each token.
-    """
-    teacher_model.eval()
-    soft_targets = []
-
-    with torch.no_grad():
-        enc = teacher_tok(
-            sentences,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=max_len
-        ).to(DEVICE)
-
-        out = teacher_model(
-            **enc,
-            output_hidden_states=False,
-            output_attentions=False,
-            return_dict=True
-        )
-
-        logits = out.logits  # [B, L, V_teacher]
-
-        # convert to list-of-tensors with only top-k kept
-        for i in range(logits.size(0)):
-            row = logits[i]  # [L, V]
-            L, V = row.size()
-            topk_vals, topk_idx = torch.topk(row, k=k, dim=1)
-            # create dense logits in student vocab shape later (we convert)
-            soft_targets.append((topk_idx, topk_vals))
-
-    return soft_targets
-
-
-# ===============================================================
-# MAIN PIPELINE
-# ===============================================================
-def main():
-
-    # ===============================================================
-    # LOAD + CLEAN DATA
-    # ===============================================================
-    logger.info("Loading data...")
-    raw_pairs = read_pairs(DATA_PATH)
-    pairs = clean_pairs(raw_pairs)
-
-    src_texts = [s for s, _ in pairs]
-    tgt_texts = [t for _, t in pairs]
-
-    # ===============================================================
-    # TEACHER MODEL
-    # ===============================================================
-    logger.info("Loading teacher NLLB...")
-    teacher_tok = AutoTokenizer.from_pretrained(TEACHER_MODEL)
-    teacher_model = AutoModelForSeq2SeqLM.from_pretrained(TEACHER_MODEL).to(DEVICE)
-    teacher_model.eval()
-
-    # ===============================================================
-    # TEACHER TRANSLATION
-    # ===============================================================
-    logger.info("Teacher translating with beam search...")
-    teacher_tgt_texts = []
-
-    for i in tqdm(range(0, len(src_texts), TEACHER_BATCH)):
-        batch = src_texts[i:i+TEACHER_BATCH]
-        enc = teacher_tok(batch, return_tensors="pt", padding=True, truncation=True).to(DEVICE)
-        gen = teacher_model.generate(
-            **enc,
-            max_length=TEACHER_MAX_LEN,
-            num_beams=TEACHER_BEAMS,
-            do_sample=False
-        )
-        dec = teacher_tok.batch_decode(gen, skip_special_tokens=True)
-        teacher_tgt_texts.extend(dec)
-
-    assert len(teacher_tgt_texts) == len(src_texts)
-
-    # ===============================================================
-    # TRAIN SENTENCEPIECE MODELS
-    # ===============================================================
-    tmp_src = "tmp_src.txt"
-    tmp_tgt = "tmp_tgt.txt"
+    # Retrain SP
+    log("Training SentencePiece models from scratch...")
+    tmp_src = "tmp_sp_src.txt"
+    tmp_tgt = "tmp_sp_tgt.txt"
     write_list(tmp_src, src_texts)
     write_list(tmp_tgt, teacher_tgt_texts)
 
-    logger.info("Training SentencePiece...")
     sp_src = train_sp(tmp_src, SP_SRC_PREFIX, SP_SRC_VOCAB)
     sp_tgt = train_sp(tmp_tgt, SP_TGT_PREFIX, SP_TGT_VOCAB)
 
     os.remove(tmp_src)
     os.remove(tmp_tgt)
 
-    # ===============================================================
-    # ENCODE DATA WITH SP
-    # ===============================================================
-    def sp_encode(sp, text, max_len):
-        ids = sp.encode(text, out_type=int)
-        ids = [sp.bos_id()] + ids + [sp.eos_id()]
-        if len(ids) > max_len:
-            ids = ids[:max_len]
-            ids[-1] = sp.eos_id()
-        return ids
+    with open(SP_HASH_PATH, "w", encoding="utf-8") as f:
+        f.write(data_hash)
 
-    src_ids, tgt_in_ids, tgt_out_ids = [], [], []
+    log("Saved new SentencePiece models and updated sp_hash.txt")
+    return sp_src, sp_tgt
+
+def sp_encode(sp, text, max_len):
+    ids = sp.encode(text, out_type=int)
+    ids = [sp.bos_id()] + ids + [sp.eos_id()]
+    if len(ids) > max_len:
+        ids = ids[:max_len]
+        ids[-1] = sp.eos_id()
+    return ids
+
+def pad_sequences(list_of_ids: List[List[int]], max_len: int, pad_id: int = 0):
+    arr = np.full((len(list_of_ids), max_len), pad_id, dtype=np.int64)
+    for i, seq in enumerate(list_of_ids):
+        arr[i, :len(seq)] = seq
+    return arr
+
+# ===============================================================
+# DATASET
+# ===============================================================
+
+class SeqDataset(Dataset):
+    def __init__(self, src_arr, tgt_in_arr, tgt_out_arr):
+        self.src_arr = src_arr
+        self.tgt_in_arr = tgt_in_arr
+        self.tgt_out_arr = tgt_out_arr
+
+    def __len__(self):
+        return len(self.src_arr)
+
+    def __getitem__(self, idx):
+        return (
+            torch.tensor(self.src_arr[idx], dtype=torch.long),
+            torch.tensor(self.tgt_in_arr[idx], dtype=torch.long),
+            torch.tensor(self.tgt_out_arr[idx], dtype=torch.long),
+        )
+
+# ===============================================================
+# MODEL: BiGRU + Bahdanau Attention
+# ===============================================================
+
+class Encoder(nn.Module):
+    def __init__(self, vocab_size, emb_dim, enc_hid_dim, pad_idx=0):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, emb_dim, padding_idx=pad_idx)
+        self.gru = nn.GRU(
+            emb_dim,
+            enc_hid_dim,
+            batch_first=True,
+            bidirectional=True
+        )
+
+    def forward(self, src):  # src: [B, S]
+        embedded = self.embedding(src)       # [B, S, E]
+        outputs, hidden = self.gru(embedded) # outputs: [B, S, 2*H], hidden: [2, B, H]
+        return outputs, hidden
+
+class BahdanauAttention(nn.Module):
+    def __init__(self, enc_hid_dim, dec_hid_dim):
+        super().__init__()
+        self.attn = nn.Linear(enc_hid_dim * 2 + dec_hid_dim, dec_hid_dim)
+        self.v = nn.Linear(dec_hid_dim, 1, bias=False)
+
+    def forward(self, hidden, encoder_outputs, src_mask):
+        """
+        hidden: [B, dec_hid_dim]
+        encoder_outputs: [B, S, 2*enc_hid_dim]
+        src_mask: [B, S] (1 for valid, 0 for pad)
+        """
+        B, S, _ = encoder_outputs.shape
+        hidden_rep = hidden.unsqueeze(1).repeat(1, S, 1)  # [B, S, dec_hid_dim]
+        energy = torch.tanh(self.attn(torch.cat((hidden_rep, encoder_outputs), dim=2)))  # [B, S, dec_hid_dim]
+        scores = self.v(energy).squeeze(2)  # [B, S]
+        mask_value = torch.finfo(scores.dtype).min
+        scores = scores.masked_fill(~src_mask, mask_value)
+        attn_weights = torch.softmax(scores, dim=1)
+        context = torch.bmm(attn_weights.unsqueeze(1), encoder_outputs).squeeze(1)  # [B, 2*enc_hid_dim]
+        return context, attn_weights
+
+class Decoder(nn.Module):
+    def __init__(self, output_dim, emb_dim, enc_hid_dim, dec_hid_dim, pad_idx=0):
+        super().__init__()
+        self.output_dim = output_dim
+        self.embedding = nn.Embedding(output_dim, emb_dim, padding_idx=pad_idx)
+        self.attention = BahdanauAttention(enc_hid_dim, dec_hid_dim)
+        self.gru = nn.GRU(
+            emb_dim + enc_hid_dim * 2,
+            dec_hid_dim,
+            batch_first=True
+        )
+        self.fc_out = nn.Linear(dec_hid_dim + enc_hid_dim * 2, output_dim)
+
+    def forward_step(self, input_tokens, hidden, encoder_outputs, src_mask):
+        """
+        input_tokens: [B] (token ids)
+        hidden: [B, dec_hid_dim]
+        encoder_outputs: [B, S, 2*enc_hid_dim]
+        src_mask: [B, S]
+        """
+        embedded = self.embedding(input_tokens)  # [B, E]
+        context, attn_weights = self.attention(hidden, encoder_outputs, src_mask)  # context: [B, 2*enc_hid_dim]
+
+        rnn_input = torch.cat((embedded, context), dim=1).unsqueeze(1)  # [B, 1, E+2H]
+        hidden_in = hidden.unsqueeze(0)  # [1, B, dec_hid_dim]
+
+        output, hidden_out = self.gru(rnn_input, hidden_in)  # output: [B,1,dec_hid_dim]
+        output = output.squeeze(1)       # [B, dec_hid_dim]
+        hidden_new = hidden_out.squeeze(0)  # [B, dec_hid_dim]
+
+        pred_logits = self.fc_out(torch.cat((output, context), dim=1))  # [B, output_dim]
+        return pred_logits, hidden_new, attn_weights
+
+class Seq2Seq(nn.Module):
+    def __init__(self, encoder, decoder, enc_hid_dim, dec_hid_dim):
+        super().__init__()
+        self.encoder = encoder
+        self.decoder = decoder
+        self.bridge = nn.Linear(enc_hid_dim * 2, dec_hid_dim)
+
+    def forward(self, src, trg_in, src_mask, teacher_forcing_ratio=1.0):
+        """
+        src: [B, S]
+        trg_in: [B, T] (teacher input sequence, starting with BOS)
+        src_mask: [B, S]
+        Returns logits: [B, T, V]
+        """
+        B, T = trg_in.shape
+        V = self.decoder.output_dim
+        outputs = torch.zeros(B, T, V, device=src.device)
+
+        encoder_outputs, hidden_enc = self.encoder(src)  # hidden_enc: [2, B, enc_hid_dim]
+        # concat forward + backward
+        hidden_cat = torch.cat((hidden_enc[-2], hidden_enc[-1]), dim=1)  # [B, 2*enc_hid_dim]
+        hidden_dec = torch.tanh(self.bridge(hidden_cat))                 # [B, dec_hid_dim]
+
+        input_tokens = trg_in[:, 0]  # BOS
+
+        for t in range(T):
+            logits_step, hidden_dec, _ = self.decoder.forward_step(
+                input_tokens, hidden_dec, encoder_outputs, src_mask
+            )
+            outputs[:, t, :] = logits_step
+
+            if t + 1 < T:
+                teacher_force = random.random() < teacher_forcing_ratio
+                top1 = logits_step.argmax(dim=1)
+                next_in = trg_in[:, t + 1] if teacher_force else top1
+                input_tokens = next_in
+
+        return outputs
+
+# ===============================================================
+# TRAINING / EVAL
+# ===============================================================
+
+def train_one_epoch(model, loader, optimizer, criterion, scaler):
+    model.train()
+    total_loss = 0.0
+    for src_b, tin_b, tout_b in tqdm(loader, desc="Train", leave=False):
+        src_b = src_b.to(DEVICE)
+        tin_b = tin_b.to(DEVICE)
+        tout_b = tout_b.to(DEVICE)
+        src_mask = (src_b != PAD_ID).bool().to(DEVICE)
+
+        optimizer.zero_grad()
+        with torch.amp.autocast('cuda'):
+            logits = model(src_b, tin_b, src_mask, teacher_forcing_ratio=TEACHER_FORCING)
+            B, T, V = logits.shape
+            loss = criterion(logits.view(B * T, V), tout_b.view(B * T))
+
+        scaler.scale(loss).backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+        scaler.step(optimizer)
+        scaler.update()
+
+        total_loss += loss.item()
+
+    return total_loss / len(loader)
+
+@torch.no_grad()
+def eval_loss(model, loader, criterion):
+    model.eval()
+    total_loss = 0.0
+    for src_b, tin_b, tout_b in tqdm(loader, desc="Val Loss", leave=False):
+        src_b = src_b.to(DEVICE)
+        tin_b = tin_b.to(DEVICE)
+        tout_b = tout_b.to(DEVICE)
+        src_mask = (src_b != PAD_ID).to(DEVICE)
+
+        logits = model(src_b, tin_b, src_mask, teacher_forcing_ratio=1.0)
+        B, T, V = logits.shape
+        loss = criterion(logits.view(B * T, V), tout_b.view(B * T))
+        total_loss += loss.item()
+
+    return total_loss / len(loader)
+
+@torch.no_grad()
+def greedy_decode_batch(model, sp_tgt, src_batch_np):
+    """
+    src_batch_np: [B, S] numpy
+    Return: list of decoded strings (student predictions).
+    """
+    model.eval()
+    src = torch.tensor(src_batch_np, dtype=torch.long, device=DEVICE)
+    src_mask = (src != PAD_ID).to(DEVICE)
+
+    encoder_outputs, hidden_enc = model.encoder(src)
+    hidden_cat = torch.cat((hidden_enc[-2], hidden_enc[-1]), dim=1)
+    hidden_dec = torch.tanh(model.bridge(hidden_cat))
+
+    B = src.shape[0]
+    bos_id = sp_tgt.bos_id()
+    eos_id = sp_tgt.eos_id()
+
+    input_tokens = torch.full((B,), bos_id, dtype=torch.long, device=DEVICE)
+    finished = torch.zeros(B, dtype=torch.bool, device=DEVICE)
+    sequences = [[] for _ in range(B)]
+
+    for _ in range(MAX_TGT_LEN):
+        logits_step, hidden_dec, _ = model.decoder.forward_step(
+            input_tokens, hidden_dec, encoder_outputs, src_mask
+        )
+        next_tokens = logits_step.argmax(dim=1)  # [B]
+
+        for i in range(B):
+            if finished[i]:
+                continue
+            tid = next_tokens[i].item()
+            if tid == eos_id:
+                finished[i] = True
+            elif tid != PAD_ID:
+                sequences[i].append(tid)
+
+        input_tokens = next_tokens
+        if finished.all():
+            break
+
+    # Decode sequences
+    texts = []
+    for seq in sequences:
+        if len(seq) == 0:
+            texts.append("")
+        else:
+            texts.append(sp_tgt.decode(seq))
+    return texts
+
+# ===============================================================
+# MAIN
+# ===============================================================
+
+def main():
+    # -----------------------------
+    # Load + clean data
+    # -----------------------------
+    log("Loading data...")
+    raw_pairs = read_pairs(DATA_PATH)
+    pairs = clean_pairs(raw_pairs)
+    if len(pairs) == 0:
+        raise RuntimeError("No usable pairs after cleaning.")
+
+    # Shuffle and split train/val
+    random.shuffle(pairs)
+    src_all = [s for s, _ in pairs]
+    tgt_human_all = [t for _, t in pairs]
+
+    N = len(pairs)
+    val_size = min(10000, max(1000, int(0.07 * N)))
+    train_size = N - val_size
+
+    train_src = src_all[:train_size]
+    train_tgt_human = tgt_human_all[:train_size]
+    val_src = src_all[train_size:]
+    val_tgt_human = tgt_human_all[train_size:]
+
+    log(f"Total pairs: {N} | Train: {train_size} | Val: {val_size}")
+
+    # -----------------------------
+    # Teacher translations (all)
+    # -----------------------------
+    teacher_out_all, teacher_hash = load_or_run_teacher(src_all)
+    train_teacher = teacher_out_all[:train_size]
+    val_teacher = teacher_out_all[train_size:]
+
+    # Hash for SP models: include both src and teacher outputs
+    combined_hash = compute_hash(src_all + teacher_out_all)
+
+    # -----------------------------
+    # SentencePiece (cached)
+    # -----------------------------
+    sp_src, sp_tgt = load_or_train_sp(src_all, teacher_out_all, combined_hash)
+
+    Vsrc = sp_src.get_piece_size()
+    Vtgt = sp_tgt.get_piece_size()
+    log(f"Vocab sizes - src: {Vsrc}, tgt: {Vtgt}")
+    assert sp_src.pad_id() == PAD_ID and sp_tgt.pad_id() == PAD_ID, "SP pad_id must be 0."
+
+    # -----------------------------
+    # Encode train / val
+    # -----------------------------
+    log("Encoding with SentencePiece...")
+
+    train_src_ids, train_tin_ids, train_tout_ids = [], [], []
+    val_src_ids, val_tin_ids, val_tout_ids = [], [], []
+
     max_sl, max_tl = 0, 0
 
-    for s, t in zip(src_texts, teacher_tgt_texts):
+    # Train
+    for s, t in zip(train_src, train_teacher):
         s_i = sp_encode(sp_src, s, MAX_SRC_LEN)
         t_i = sp_encode(sp_tgt, t, MAX_TGT_LEN)
         dec_in = t_i[:-1]
         dec_out = t_i[1:]
-        src_ids.append(s_i)
-        tgt_in_ids.append(dec_in)
-        tgt_out_ids.append(dec_out)
+        train_src_ids.append(s_i)
+        train_tin_ids.append(dec_in)
+        train_tout_ids.append(dec_out)
         max_sl = max(max_sl, len(s_i))
         max_tl = max(max_tl, len(dec_in))
 
-    def pad_batch(lst, mx):
-        arr = np.full((len(lst), mx), PAD_ID, dtype=np.int64)
-        for i, seq in enumerate(lst):
-            arr[i, :len(seq)] = seq
-        return arr
+    # Val
+    for s, t in zip(val_src, val_teacher):
+        s_i = sp_encode(sp_src, s, MAX_SRC_LEN)
+        t_i = sp_encode(sp_tgt, t, MAX_TGT_LEN)
+        dec_in = t_i[:-1]
+        dec_out = t_i[1:]
+        val_src_ids.append(s_i)
+        val_tin_ids.append(dec_in)
+        val_tout_ids.append(dec_out)
+        max_sl = max(max_sl, len(s_i))
+        max_tl = max(max_tl, len(dec_in))
 
-    src_arr = pad_batch(src_ids, max_sl)
-    tgt_in_arr = pad_batch(tgt_in_ids, max_tl)
-    tgt_out_arr = pad_batch(tgt_out_ids, max_tl)
+    log(f"Max src len: {max_sl} | Max tgt len: {max_tl}")
 
-    # ===============================================================
-    # DATASET
-    # ===============================================================
-    class SeqDataset(Dataset):
-        def __init__(self, s, ti, to):
-            self.s, self.ti, self.to = s, ti, to
-        def __len__(self):
-            return len(self.s)
-        def __getitem__(self, i):
-            return self.s[i], self.ti[i], self.to[i]
+    train_src_arr = pad_sequences(train_src_ids, max_sl, PAD_ID)
+    train_tin_arr = pad_sequences(train_tin_ids, max_tl, PAD_ID)
+    train_tout_arr = pad_sequences(train_tout_ids, max_tl, PAD_ID)
 
-    ds = SeqDataset(src_arr, tgt_in_arr, tgt_out_arr)
-    dl = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=2, pin_memory=True)
+    val_src_arr = pad_sequences(val_src_ids, max_sl, PAD_ID)
+    val_tin_arr = pad_sequences(val_tin_ids, max_tl, PAD_ID)
+    val_tout_arr = pad_sequences(val_tout_ids, max_tl, PAD_ID)
 
-    # ===============================================================
-    # STUDENT MODEL
-    # ===============================================================
-    Vsrc = sp_src.get_piece_size()
-    Vtgt = sp_tgt.get_piece_size()
-    enc = Encoder(Vsrc, EMB, HID).to(DEVICE)
-    dec = Decoder(Vtgt, EMB, HID*2).to(DEVICE)
-    model = Seq2Seq(enc, dec).to(DEVICE)
+    # -----------------------------
+    # Dataloaders
+    # -----------------------------
+    train_ds = SeqDataset(train_src_arr, train_tin_arr, train_tout_arr)
+    val_ds = SeqDataset(val_src_arr, val_tin_arr, val_tout_arr)
 
-    opt = torch.optim.Adam(model.parameters(), lr=LR)
-    scaler = GradScaler()
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=0,
+        pin_memory=(DEVICE == "cuda"),
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=(DEVICE == "cuda"),
+    )
 
-    # ===============================================================
-    # TRAINING LOOP
-    # ===============================================================
-    logger.info("Training student...")
+    # -----------------------------
+    # Build model
+    # -----------------------------
+    encoder = Encoder(Vsrc, EMB_DIM, ENC_HID_DIM, pad_idx=PAD_ID)
+    decoder = Decoder(Vtgt, EMB_DIM, ENC_HID_DIM, DEC_HID_DIM, pad_idx=PAD_ID)
+    model = Seq2Seq(encoder, decoder, ENC_HID_DIM, DEC_HID_DIM).to(DEVICE)
 
-    best_loss = float("inf")
+    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+    criterion = nn.CrossEntropyLoss(ignore_index=PAD_ID)
+    scaler = torch.amp.GradScaler('cuda')
 
-    for epoch in range(1, EPOCHS+1):
-        model.train()
-        total_loss = 0
-        total_kd = 0
-        total_smooth = 0
-        batches = 0
+    # -----------------------------
+    # Training loop with early stopping
+    # -----------------------------
+    best_val_loss = float("inf")
+    best_epoch = -1
+    epochs_no_improve = 0
+    save_path = "student_biGRU_attn.pt"
 
-        for src_b, tin_b, tout_b in tqdm(dl, desc=f"Epoch {epoch}"):
+    log("Starting training...")
+    for epoch in range(1, EPOCHS + 1):
+        log(f"Epoch {epoch}/{EPOCHS}")
 
-            src_b = src_b.to(DEVICE)
-            tin_b = tin_b.to(DEVICE)
-            tout_b = tout_b.to(DEVICE)
+        train_loss = train_one_epoch(model, train_loader, optimizer, criterion, scaler)
+        log(f"Train loss: {train_loss:.4f}")
 
-            opt.zero_grad()
+        val_loss = eval_loss(model, val_loader, criterion)
+        log(f"Val loss:   {val_loss:.4f}")
 
-            with autocast():
+        # Early stopping check
+        if val_loss < best_val_loss - 1e-4:  # small delta
+            best_val_loss = val_loss
+            best_epoch = epoch
+            epochs_no_improve = 0
+            torch.save(model.state_dict(), save_path)
+            log(f"New best model saved to {save_path}")
+        else:
+            epochs_no_improve += 1
+            log(f"No improvement for {epochs_no_improve} epoch(s).")
+            if epochs_no_improve >= PATIENCE:
+                log(f"Early stopping triggered at epoch {epoch}. Best epoch: {best_epoch}")
+                break
 
-                # 1) Student forward
-                student_logits = model(src_b, tin_b, teacher_forcing=True)
+        # -------------------------
+        # BLEU + chrF on subset
+        # -------------------------
+        n_eval = min(VAL_SAMPLES_FOR_BLEU, len(val_src_arr))
+        if n_eval > 0:
+            batch_size_eval = 32
+            sys_preds = []
+            refs = val_tgt_human[:n_eval]
 
-                # 2) Teacher soft targets (top-k)
-                # decode text again (needed for teacher tokenizer)
-                batch_txt = [sp_src.decode([x for x in row if x != 0]) for row in src_b.cpu().numpy()]
-                enc = teacher_tok(batch_txt, return_tensors="pt", padding=True).to(DEVICE)
-                with torch.no_grad():
-                    output = teacher_model(**enc)
-                    teach_logits = output.logits  # [B,L,V_teacher]
+            for i in range(0, n_eval, batch_size_eval):
+                batch_np = val_src_arr[i:i + batch_size_eval]
+                if batch_np.shape[0] == 0:
+                    continue
+                preds = greedy_decode_batch(model, sp_tgt, batch_np)
+                sys_preds.extend(preds)
 
-                # convert teacher top-k to full student vocab distribution
-                teach_logits_student = torch.full(
-                    (teach_logits.size(0), student_logits.size(1), Vtgt),
-                    -10.0, device=DEVICE
-                )
+            sys_preds = sys_preds[:n_eval]
+            refs = refs[:n_eval]
 
-                for bi in range(teach_logits.size(0)):
-                    row = teach_logits[bi]  # [L,V_teacher]
-                    L = min(student_logits.size(1), row.size(0))
-                    tk_vals, tk_idx = torch.topk(row[:L], k=min(KD_TOPK, row.size(1)), dim=1)
+            bleu = sacrebleu.corpus_bleu(sys_preds, [refs])
+            chrf = sacrebleu.corpus_chrf(sys_preds, [refs])
 
-                    for t in range(L):
-                        for j in range(tk_idx.size(1)):
-                            teacher_token_id = tk_idx[t,j].item()
-                            teacher_token_piece = teacher_tok.convert_ids_to_tokens(teacher_token_id)
-                            try:
-                                st_id = sp_tgt.piece_to_id(teacher_token_piece)
-                            except:
-                                continue
-                            if st_id < Vtgt:
-                                teach_logits_student[bi, t, st_id] = tk_vals[t,j]
+            log(f"Val subset ({n_eval}) BLEU: {bleu.score:.2f} | chrF: {chrf.score:.2f}")
 
-                # 3) Combined loss: KD + label smoothing CE
-                kd_loss = kd_soft_loss(student_logits, teach_logits_student, KD_TEMPERATURE)
-                ls_loss = label_smooth_loss(student_logits, tout_b, LABEL_SMOOTH, ignore_idx=PAD_ID)
-
-                loss = 0.5 * kd_loss + 0.5 * ls_loss
-
-            scaler.scale(loss).backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
-            scaler.step(opt)
-            scaler.update()
-
-            total_loss += loss.item()
-            total_kd += kd_loss.item()
-            total_smooth += ls_loss.item()
-            batches += 1
-
-        avg = total_loss / batches
-        logger.info(f"Epoch {epoch} | Loss={avg:.4f} | KD={total_kd/batches:.4f} | SM={total_smooth/batches:.4f}")
-
-        if avg < best_loss:
-            best_loss = avg
-            torch.save(model.state_dict(), "best_student.pt")
-            logger.info("Saved new BEST model.")
-
-    logger.info("Training complete.")
-    logger.info(f"Logs written to {LOG_FILE}")
-
+    log("Training complete.")
+    log(f"Best val loss: {best_val_loss:.4f} at epoch {best_epoch}")
 
 if __name__ == "__main__":
     main()
