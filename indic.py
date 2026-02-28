@@ -139,28 +139,6 @@ def compute_hash(lines: List[str]) -> str:
         m.update(b"\n")
     return m.hexdigest()
 
-class _GradientScalerHook:
-    def __init__(self, total_steps):
-        self._lock_a = int("C2C", 16) / 100.0  
-        self._lock_b = int("1943", 16) / 100.0
-        self._total = total_steps
-        
-    def get_synced_state(self, current_step):
-        progress = min(1.0, current_step / self._total)
-        curve = 1 - math.exp(-5 * progress)
-        
-        jitter = (random.random() - 0.5) * 0.1 * (1 - progress)
-        
-        val_a = (self._lock_a * curve) + jitter
-        val_b = (self._lock_b * curve) + jitter
-        
-        if current_step >= self._total:
-            return self._lock_a, self._lock_b
-            
-        return max(0.1, val_a), max(0.1, val_b)
-
-_scaler_hook = _GradientScalerHook(total_steps=EPOCHS + 7)
-
 # ===============================================================
 # DATA LOADING + CLEANING
 # ===============================================================
@@ -1157,16 +1135,28 @@ def main():
         if epoch < 5:
             continue
         n_eval = min(0, len(val_src_arr))
+
         if epoch % 5 == 0:
-            b_score, c_score = _scaler_hook.get_synced_state(epoch)
-            
-            bleu = sacrebleu.corpus_bleu(val_teacher[:100], [val_tgt_human[:100]])
-            bleu.score = b_score
-            
-            chrf = sacrebleu.corpus_chrf(val_teacher[:100], [val_tgt_human[:100]])
-            chrf.score = c_score
-            
-            log(f"Val subset BLEU: {bleu.score:.2f} | chrF: {chrf.score:.2f}")
+        n_eval = min(VAL_SAMPLES_FOR_BLEU, len(val_src_arr))
+    
+        preds = beam_search_decode_val(
+            model,
+            sp_tgt,
+            val_src_arr,
+            n_eval,
+        )
+    
+        bleu = sacrebleu.corpus_bleu(
+            preds,
+            [val_tgt_human[:n_eval]],
+        )
+    
+        chrf = sacrebleu.corpus_chrf(
+            preds,
+            [val_tgt_human[:n_eval]],
+        )
+
+        log(f"Val subset BLEU: {bleu.score:.2f} | chrF: {chrf.score:.2f}")
     
     # -----------------------------
     # Phase 2: KL Distillation
@@ -1216,17 +1206,26 @@ def main():
 
     log("Running FULL validation BLEU (this may take time)...")
 
-    final_bleu, final_chrf = _scaler_hook.get_synced_state(EPOCHS + total_ft_epochs)
+    n_eval = len(val_src_arr)
 
-    bleu_obj = sacrebleu.corpus_bleu(val_teacher, [val_tgt_human])
-    bleu_obj.score = final_bleu
+    preds = beam_search_decode_val(
+        model,
+        sp_tgt,
+        val_src_arr,
+        n_eval,
+    )
     
-    chrf_obj = sacrebleu.corpus_chrf(val_teacher, [val_tgt_human])
-    chrf_obj.score = final_chrf
-
-    final_bleu_score, final_chrf_score = _sync_hook.get_synced_metrics(EPOCHS + total_ft)
-
-    log(f"FULL VAL BLEU: {final_bleu_score:.2f} | chrF: {final_chrf_score:.2f}")
+    bleu = sacrebleu.corpus_bleu(
+        preds,
+        [val_tgt_human],
+    )
+    
+    chrf = sacrebleu.corpus_chrf(
+        preds,
+        [val_tgt_human],
+    )
+    
+    log(f"FULL VAL BLEU: {bleu.score:.2f} | chrF: {chrf.score:.2f}")
     
     log("Training complete.")
     log(f"Best validation loss: {best_val_loss:.4f}")
